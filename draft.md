@@ -1,101 +1,263 @@
-# Thesis idea:
-## Real-Time Fraud Detection System
-This project focuses on identifying suspicious patterns (like multiple rapid transactions from different locations) as they happen.
-- The Business Case: Online retailers lose billions to credit card fraud. Detecting fraud after the transaction is costly; blocking it in real-time saves revenue and improves customer trust.
-- Technical Implementation:
-  - Use Go to simulate a stream of transaction data.
-  - Produce messages to a Kafka topic.
-  - Build a Go-based Consumer that implements a "Rules Engine" (e.g., checking transaction frequency or velocity).
-  - Store flagged transactions in a NoSQL database (like MongoDB or Redis) for a dashboard.
-- Thesis Focus: Latency analysis. How fast can the system flag a transaction under high load?
+# BSc Thesis Idea: Real-Time Fraud Detection System (Redpanda + Go)
 
-### The Architecture
-The system consists of three main components: the Data Simulator, the Kafka Backbone, and the Go Analysis Engine.
+## Overview
+This project focuses on identifying suspicious transactional patterns (like multiple rapid transactions from different locations or currency mismatches) in real-time using a modern, high-performance streaming architecture.
 
-#### 1. The Producer (Transaction Simulator)
-Since you won't have access to live bank feeds, you will write a Go program that generates realistic JSON transaction data.
-- Fields: transaction_id, user_id, amount, timestamp, location, and card_type.
-- The "Hook": Your simulator should occasionally inject "Fraudulent Patterns," such as:
-  - The "Speed Demon": Three transactions for the same user_id in three different cities within 10 minutes.
-  - The "Large Spender": A transaction 500% higher than the user's average.
+- **The Business Case:** Online retailers and banks lose billions annually to credit card fraud. Detecting fraud *after* the transaction is processed is reactive and costly; identifying it in-flight allows for real-time blocking, saving revenue and increasing customer security.
+- **Thesis Focus:** Performance and Latency analysis. The research will evaluate how a C++-based broker (Redpanda) paired with a native Go implementation handles high-load fraud scenarios.
+
+---
+
+## 0. Research
+
+### 0.1 Core Cardholder Data (The "Identity")
+This is the basic information required to identify your account. Most of this is strictly regulated by the **PCI DSS** (Payment Card Industry Data Security Standard).
+
+|Data Field|Description|
+|---|---|
+|PAN (Primary Account Number)|The 16-digit number on your card.|
+|Cardholder Name|Your full name as it appears on the account.|
+|Expiration Date|The month and year the card expires.|
+|CVV2/CVC2/CID|The 3 or 4-digit security code (used almost exclusively for online transactions).|
+|Track Data (PoS Only)|The raw data stored on the magnetic stripe or chip, including the Service Code (which tells the terminal if the card has a chip).|
+
+### 0.2 Transactional & Merchant Data (The "What & Where")
+This data tells the bank who is asking for money and for what purpose.
+- **MID & TID**: Merchant ID and Terminal ID (identifies the specific business and the specific device).
+- **MCC (Merchant Category Code)**: A 4-digit code (e.g., 5411 for Grocery Stores) used by banks to categorize spending and calculate rewards.
+- **Transaction Metadata**: Date, time, amount, currency, and "Entry Mode" (e.g., Tap, Chip, or Manual Key-in).
+- **Level 2 & 3 Data**: In B2B or corporate purchases, banks collect line-item details:
+  - **SKUs/Item Descriptions**: Exactly what was bought.
+  - **Quantity & Unit Price**: Breakdowns of each item.
+  - **Tax & Shipping**: Detailed tax amounts and freight costs.
+
+### 0.3. Online-Specific Data (The "Context")
+Because the merchant cannot see you in person, online shops collect "contextual" data to prove you are who you say you are.     
+**Technical & Device Fingerprinting**      
+- **IP Address**: Your digital location (used to see if a purchase from "New York" is coming from a server in "Eastern Europe").
+- **User Agent**: Your browser type, version, and operating system.
+- **Hardware Specs**: Screen resolution, battery level, time zone, and system languages.
+- **3D Secure (3DS) Elements**: This protocol (e.g., Verified by Visa) sends over 150 data points, including your account age at that store and how many times you’ve changed your password recently.     
+**Behavioral Biometrics**   
+Modern fraud engines (like LexisNexis or ThreatMetrix) analyze **how** you interact with the page:
+- **Keystroke Dynamics**: Your typing speed and the "dwell time" (how long you hold down a key).
+- **Mouse Patterns**: The trajectory and jitter of your cursor movement.
+- **Touch Screen Data**: The pressure of your thumb and the angle at which you hold your phone.
+
+### 0.4. Physical PoS-Specific Data
+Physical transactions rely more on hardware-to-hardware communication:
+- **EMV Chip Data**: A "cryptogram" (a one-time digital signature) generated by the chip that proves the card isn't a clone.
+- **Geolocation**: The GPS coordinates of the terminal compared against your phone's known location (if you have "Location Sharing" enabled with your bank app).
+- **PIN Block**: The encrypted version of your 4-digit PIN (never stored in "plain text").
+
+**Comparison: Physical vs. Online**
+|Data Type|Physical (PoS)|Online (CNP)|
+|---|---|---|
+|CVV Security Code|Rarely used|Mandatory|
+|Billing Address|Not required|Crucial for verification|
+|Device ID|Terminal ID|IP & Browser Fingerprint|
+|Biometrics|Physical signature (rare)|FaceID/TouchID (via Apple/Google Pay)|
+
+---
+
+## 1. The Architecture
+The system is built as a reactive pipeline consisting of three primary components.
+
+### 1.1 The Producer (Transaction Simulator)
+A Go-based service that generates a high-velocity stream of synthetic transaction data.
+- **Key Capability:** It simulates both "Normal" user behavior and "Fraudulent" patterns to test the detection engine.
+- **Data Model:** Includes `TransactionID`, `UserID`, `Amount`, `Currency`, `BaseCurrency`, `Location`, `UserAgent`, `BrowserType`, `IsEMV`, `EntryMode` and `IPAddress`.
+There can be multiple instances of the Transaction Simulator running in parallel to generate a high-velocity stream of synthetic transaction data even with different configurations to simulate different transaction types like PoS and online bank card transactions.
+
+### 1.2 The Streaming Layer (Redpanda)
+Redpanda serves as the backbone, providing a Kafka-API compatible interface without the complexity of [ZooKeeper](https://zookeeper.apache.org/) or the JVM.
+- **Why Redpanda:** Its thread-per-core architecture and zero-copy design make it ideal for low-latency financial applications.
+- **Topology:** Uses a `raw-transactions` topic for ingestion and a `flagged-fraud` topic for downstream alerts.
+- **Redpanda Schema Registry:** To ensure data consistency and compatibility across different systems, data governance is crucial. Redpanda supports [Protobuf](https://protobuf.dev/) format for data serialization and deserialization, ensuring that data is structured and validated according to predefined schemas. (I'm using Protobuf because it is more performant than [AVRO](https://avro.apache.org/docs/) and [JSON](https://json.org/)). I'll use [Redpanda Schema Registry](https://docs.redpanda.com/current/manage/schema-reg/schema-reg-overview/) logic in the Go code to manage and enforce schemas.
+
+### 1.3 The Consumer (Go Analysis Engine)
+There are 2 types of Analysis Engines: 1 for PoS and 1 for online bank card transactions. This way the domains are separated and can be scaled independently ([Domain-Driven Design](?) EVANS, Eric. Domain-driven design: tackling complexity in the heart of software. Addison-Wesley Professional, 2004.).
+The core logic of the thesis, utilizing Go’s concurrency primitives (goroutines and channels) to process streams.
+- **Stateful Analysis:** Uses a sliding window approach to track a user's transaction history over time.
+- **In-Memory Cache:** Integrates with [**Redis**](https://redis.io/) to store and retrieve user state (e.g., "last seen location") with sub-millisecond latency.
+- **The "Dead Letter Queue" (DLQ):** A mechanism to handle failed or invalid messages, ensuring no data loss and allowing for retries or manual intervention anhancing fault tolerance. Redpanda does not provide a built-in dead-letter queue (DLQ) mechanism, but it allows users to implement a [dead-letter topic (DLT)](https://www.redpanda.com/blog/reliable-message-processing-with-dead-letter-queue) by using an existing Redpanda topic to serve as the DLQ. If the Go engine cannot parse a message from `raw-transactions`, it should move it to a `fraud-dlq` topic in Redpanda instead of simply dropping it.
+
+
+#### 1.3.1 Potential Fraud Detection rules in Analysis Engine:
+**1. PoS Terminal Checks (Physical World)**
+  - **Impossible Travel (Velocity)**: If a card is swiped in Budapest and then 15 minutes later at a PoS in London. Redis State: last_location, last_timestamp. This can be described as a mathematical formula that calculates the distance between two locations and compares it to the time elapsed between the transactions. (but not here in the draft.md ... later in the Thesis)
+  - **Fallback Attack**: Flag if a modern chip-card (IsEMV: true) is suddenly processed via "Magnetic Stripe" (EntryMode: Swipe). This often indicates a cloned card.
+  - **Merchant Category Anomaly**: A sudden high-value purchase at a "Jewelry Store" for a user who typically only spends at "Groceries." 
+  - Suspicious Time of Day: If a card is used during off-peak hours (e.g., midnight) for a user who usually spends during business hours.   
   
-#### 2. The Streaming Layer (Apache Kafka)
-Kafka acts as the buffer. Even if your analysis engine slows down, Kafka holds the data so no transactions are lost.
-- Topics: Use a raw-transactions topic for incoming data and a flagged-fraud topic for the output of your analysis.
 
-#### 3. The Consumer (Go Analysis Engine)
-This is the "brain" of your thesis. You will use Go’s concurrency primitives to process messages.
-- Sliding Windows: Use a Go-based "Windowing" logic. For a specific user_id, look at the last 60 minutes of data stored in an in-memory cache (like Redis or a thread-safe Go Map).
-- Concurrency: Use multiple goroutines to process different partitions of Kafka topics simultaneously.
+**2. Online Fraud Checks (Digital World)**
+  - **Suspicious IP Address**: If a card is used from an IP address that is known to be associated with fraudulent activity.
+  - **Suspicious Email Domain**: If a card is used from an email domain that is known to be associated with fraudulent activity.
+  - **Suspicious User Agent**: If a card is used from a user agent that is known to be associated with fraudulent activity.
+  - **Suspicious Browser**: If a card is used from a browser that is known to be associated with fraudulent activity.
+  
+  
+### 1.4 Central State Management (Redis)
+In a high-throughput fraud system, Go instances must be stateless to scale horizontally. Redis provides the "Global Memory" needed for cross-transaction analysis across different simulator types.
 
-#### Thesis Research Questions
-A BSc thesis needs to answer a "How" or "Why." You can focus on one of these technical challenges:
-1. Latency vs. Accuracy: How does the size of the "time window" (checking the last 5 minutes vs. the last 50 minutes) affect the system's ability to catch fraud in under 100ms?
-2. State Management: How do you keep track of a user's previous transactions across multiple Go instances? (This introduces the need for an external state store like Redis).
-3. Throughput Benchmarking: At what point does the Go consumer become a bottleneck? You can measure how many thousands of transactions per second (TPS) a single Go instance can handle before latency spikes.
+- **Role in Thesis**: Facilitates stateful rules (e.g., "Has this user spent more than €5,000 across all channels in the last hour?").
+- **Key Data Structures**:
+  - **Hashes** (HSET): Stores user profiles and "last seen" metadata (e.g., user:123 -> {last_lat: 47.4, last_lon: 19.0, last_country: "HU"}).
+  - **Sorted Sets** (ZSET): Powers Sliding Windows. Every transaction timestamp is a "score," allowing Go to count events in a specific time range (e.g., "Count transactions in the last 60 seconds").
+- **Business Case**: Ensures that if a user performs a PoS transaction in Budapest and an Online purchase in Bangkok seconds later, the system can correlate them instantly regardless of which Go worker processes the message.
 
-#### Suggested Technology Stack
-- Language: Go (using the segmentio/kafka-go or confluent-kafka-go libraries).
-- Broker: Apache Kafka (running in Docker).
-- State Store: Redis (for fast lookups of "last seen" user location/balance).
-- Visualization: A simple Grafana dashboard showing the number of "Safe" vs. "Fraudulent" transactions in real-time.
+### 1.5 Monitoring and Alerting (Prometheus)
+Prometheus acts as the "Time-Series Watchdog," pulling performance and business metrics from every container via their /metrics endpoints.
+- **Go Application Metrics**: Using the prometheus/client_golang library, the engine exposes:
+  - **Fraud Hit Rate**: Counters partitioned by type (pos, online).
+  - **Processing Latency**: Histograms measuring the "Read-Calculate-Write" cycle in milliseconds.
+- **Infrastructure Metrics**:
+  - **Redpanda Lag**: Monitoring how many messages are waiting in the queue.
+  - **Redis Latency**: Ensuring the state-store isn't becoming a bottleneck.
+- **Alerting Logic**: [PromQL](https://prometheus.io/docs/prometheus/latest/querying/basics/) rules can trigger alerts if the False Positive Rate spikes or if end-to-end latency exceeds a defined threshold (e.g., > 200ms).
 
-### The Refined Transaction Model
-We distinguish between the **Transaction** details and the **Account** state at that moment.
-Fields
-- **Transaction Metadata**: `TransactionID`, `UserID`, `Timestamp`.
-- **Financials**: * `Amount`: The value in the local currency.
-  - `Currency`: The currency of the purchase (e.g., USD, EUR, HUF).
-  - `ExchangeRate`: The rate used to convert to the Account's base currency at $T_0$.
-- **Account Context**:
-  - `BaseCurrency`: The user’s home currency (e.g., a user from Germany has an account in EUR).
-  - `AccountBalance`: Remaining balance in `BaseCurrency`.
-- **Geographic Data**: IPAddress and Location (Country Code).
+### 1.6 Visualization (Grafana)
+Grafana provides the "Human Interface" for the thesis, turning raw metrics into an interactive Security Operations Center (SOC) dashboard.
+- **Proposed Dashboard Panels**:
+  - **Real-Time Geo-Map**: Visualizes transaction origins with red pulses for flagged fraud.
+  - **Transaction Volume vs. Fraud Rate**: A time-series graph showing the proportion of blocked transfers.
+  - **Simulator Health**: Status of PoS and Online simulators.
+  - **Financial Impact**: A "Counter" panel showing the total value of transactions blocked (Money Saved).
+- **Business Case**: Provides stakeholders with an immediate, visual understanding of system performance and current threat levels.
 
-Go Implementation idea: The Simulator      
-This snippet uses a "Weighted Random" approach to generate normal transactions, with a specific function to inject "Fraudulent" ones.
-``` go
-package main
+### 1.7 Data Pipeline Flow
+1. **Simulators (PoS/Online)**: Generate events → Publish to raw-transactions topic.
+2. **Analysis Engines (PoS/Online)**:
+   - **Read**: Pull transaction from Redpanda.
+   - **Fetch**: Get current user state from Redis (e.g., "last seen location").
+   - **Logic**: Run fraud checks (e.g., "is this impossible travel?").
+   - **Update**: Write the new transaction details to Redis to update the "last seen" state.
+   - **Act**: If fraud is found, publish to flagged-fraud topic.
+3. **Redis**: Stores the "Window" of recent events for each user.
+4. **Prometheus/Grafana**: Scrape metrics from the Analysis Engines to show the fraud hit rate.
 
-import (
-	"encoding/json"
-	"time"
-)
+### 1.8 Blocking Service - Out-Of-Scope
+This project won't include a blocking service, but a real world solution should read the `flagged-fraud` topic and block the user's account if fraud is detected.
 
-type Transaction struct {
-	TransactionID  string    `json:"transaction_id"`
-	UserID         string    `json:"user_id"`
-	Amount         float64   `json:"amount"`          // Amount in local currency
-	Currency       string    `json:"currency"`        // e.g., "USD"
-	BaseCurrency   string    `json:"base_currency"`   // User's home currency, e.g., "EUR"
-	ExchangeRate   float64   `json:"exchange_rate"`   // Local to Base rate
-	Location       string    `json:"location"`        // ISO Country Code
-	IPAddress      string    `json:"ip_address"`
-	Timestamp      time.Time `json:"timestamp"`
-	IsPossibleFraud bool     `json:"-"`               // Internal flag for validation
-}
+### 1.9 Reliability and Fault Tolerance 
+While the prototype utilizes single instances of Redpanda and Redis for local development, the architecture is designed for horizontal scalability.
 
-// GenerateNormalTransaction creates a typical user purchase
-func GenerateNormalTransaction(userID string) Transaction {
-	return Transaction{
-		TransactionID: "TXN-" + time.Now().Format("150405"),
-		UserID:        userID,
-		Amount:        45.50,
-		Currency:      "EUR",
-		BaseCurrency:  "EUR",
-		ExchangeRate:  1.0,
-		Location:      "DE",
-		IPAddress:     "192.168.1.1",
-		Timestamp:     time.Now(),
-	}
-}
-```
+- **Redpanda Resilience**: In a production environment, a 3-node cluster would be utilized to eliminate the Single Point of Failure (SPOF) and ensure message persistence via replication factors (Out-of-scope).
 
-### Strategic Fraud Scenarios (Thesis "Edge Cases")
-With the new `Currency` and `BaseCurrency` fields, you can now simulate **"Velocity Attacks"** involving cross-border friction:
-1. The "Distance-Currency" Mismatch
-A user typically transacts in **HUF** in **Budapest**. Suddenly, a transaction appears in **THB** (Thai Baht) from a **Bangkok** IP.
-- Logic: If `Currency != BaseCurrency` AND `Location` distance from last `Location` > 1000km within 1 hour.
-2. The "Balance Drain" (Micro-transactions)
-Attackers often test a card with small amounts in different currencies to see if it’s active.
-- Logic: 5 transactions under $2.00$ in 5 different currencies within 30 seconds.
+- **State Recovery**: The Analysis Engines implement basic retry logic for Redis connections. A future iteration would utilize Redis Sentinel for high availability (Out-of-scope).
+
+- **Dead Letter Queues (DLQ)**: Messages that fail processing due to schema mismatches or engine errors are routed to a specific `fraud-dlq` topic to prevent pipeline stalling and allow for manual audit.
+
+### 1.10 Reconciliation Service - Out-Of-Scope
+This project won't include a reconciliation service to ensure DLQ messages are processed or resolved. The focus is on the core components of the fraud detection system.
+
+### 1.11 Non-Rule-Based Fraud Detection - Out-Of-Scope
+This project won't include non-rule-based fraud detection methods such as machine learning or AI models. This project focuses exclusively on Rule-Based Hexagonal Architecture. While Machine Learning (ML) models (e.g., Random Forests or XGBoost) provide higher adaptability to new fraud patterns, they introduce significant inference latency and "black-box" decision-making. 
+An interesting future extension would be the integration of the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/docs/getting-started/intro). Rather than performing real-time inference on the stream, MCP could provide a standardized, modular interface for **Agentic Fraud Investigation**. This would allow an LLM-based "Analyst Agent" to securely pull context from the Redis State Store or the `fraud-dlq` to provide human-readable explanations for flagged transactions.
+
+---
+
+## 2. Thesis Research Questions
+To satisfy academic requirements, the project seeks to answer:
+1. **Throughput Benchmarking:** What is the maximum Transactions Per Second (TPS) the system can process on consumer-grade hardware before p99 latency exceeds 100ms?
+2. **Consumer Group Rebalancing**: How does Redpanda's partition rebalancing affect fraud detection latency when scaling Go consumers from 1 to 10 instances under heavy load?
+3. **State Bottlenecking**: At what point does the centralized Redis state store become a bottleneck for $p99$ latency compared to local in-memory state, and how do Redis Pipelines mitigate this?
+
+### 2.1 Key Metrics
+- **Throughput:** Transactions Per Second (TPS) - As the Transaction Simulator is just a mock service to generate transactions, it's not directly related to the system's throughput. TPS is measured from successful publish to the `raw-transactions` topic to the successful evaluation by the Go Analysis Engine. 
+- **Latency:** p99 latency and average latency where p99 latency is the crucial metric but I measure average latency to see how increasing load affects both.
+- **Load:** CPU usage - here I'm going to measure every service (even the Transaction Simulator) to see which services are the bottlenecks.
+- **Cache Performance:** Redis operations per second (OPS) - for this thesis I will run a single Redis instance and measure the OPS to see how it scales with increasing load. My hypothesis is that Redis will be the bottleneck as the Go Analysis Engine can scale horizontally.
+---
+
+## 3. Technology Stack
+- **Language:** [Go](https://golang.org/) (Golang)
+- **Messaging:** [Redpanda](https://redpanda.com/)
+- **State Store:** [Redis](https://redis.io/) (for central state management)
+- **Go Library:** [franz-go](https://github.com/twmb/franz-go) (High-performance, pure-Go Kafka client)
+- **Monitoring:** [Prometheus](https://prometheus.io/) & [Grafana](https://grafana.com/)
+- **Environment:** [Podman](https://podman.io/) (every component above will run in a containerized environment)
+
+|Component|Technology|Role|
+|---|---|---|
+|Messaging |Redpanda |High-performance ingestion|
+|Processing |Go (Golang) |Concurrency & Detection logic|
+|State Store |Redis |Centralized memory & Sliding windows|
+|Observability |Prometheus |Metric collection & Alerting|
+|Dashboard |Grafana |Visualization & Stakeholder reporting
+|Deployment |Podman |Rootless, containerized environment|
+
+All containers will be on the same Podman network: `fraud-net`.
+
+## 4. Implementation Details
+
+### 4.2 Services
+|Service name|Description|3rd party|Scope|
+|---|---|---|---|
+|transactionSimulator|Simulates transactions for testing|False|Yes0|
+|redpandaBroker|Redpanda broker for messaging|True|Yes|
+|analysisEngine|Performs fraud detection|False|Yes|
+|redisStateStore|Centralized state store for fraud detection|True|Yes|
+|blockingService|Blocks users based on flagged transactions|False|No|
+|reconciliationService|Reconciles DLQ messages|False|No|
+|prometheus|Collects metrics from multiple services|True|Yes0|
+|grafanaMonitoring|Monitors services using Prometheus & Grafana|True|Yes|
+
+### 4.2 Topics
+|Topic name|Description|Producers|Consumers|
+|---|---|---|---|
+|`raw-transactions`|Protobuf encoded transaction stream from all simulator instances|Transaction Simulator|Analysis Engine|
+|`flagged-fraud`|Protobuf encoded transaction stream for fraud evaluated and flagged transactions|Analysis Engine|Blocking Service|
+|`fraud-dlq`|Protobuf encoded transaction stream for technically failed transactions|Analysis Engine|Reconciliation Service|
+
+### 4.3 PoS Transaction Simulator
+prompt: This is a Go service in a container (for horizontal scalability) generate mock PoS transactions. Requirements: able to perform Load test, Slow load test, can purposefully generate inaccurate or suspicious data that should be configurable (i.e. corrupted / inaccurate data per 100 transactions). It should provide data to Prometheus. Is there anything else I should consider implementing as a feature or capability?
+
+answer:
+Your PoS Transaction Simulator is already shaping up to be a powerful tool for your thesis. Since your research focuses on performance engineering and system behavior under load, there are a few "extra mile" features that would significantly increase the academic value of your project.Here are several capabilities to consider implementing to make your simulator a more realistic and rigorous "adversary" for your analysis engine.
+
+**1. Scenario-Based Injection (Named Attacks)**
+Instead of just "corrupted data every 100 transactions," implement specific fraud scenarios that you can trigger via configuration or an API call. This allows you to measure exactly how long it takes for the system to detect a specific type of attack.
+- **The "Impossible Travel" Burst**: Force two instances of the simulator to produce transactions for the same UserID with coordinates thousands of miles apart within a 1-minute window.
+- **The "Testing the Waters" Attack**: Generate 5-10 very small transactions ($< \$1$) followed by one massive transaction.
+- **The "Card Cloner" (Fallback)**: Suddenly switch a specific UserID from IsEMV: true to EntryMode: Swipe to see if your Fallback Attack rule triggers correctly.
+
+**2. Cardinality Control (The Redis Stressor)**
+One of your research questions involves Redis bottlenecking. The biggest factor in Redis performance is often cardinality (the number of unique keys).
+- **Feature**: Add a setting for ActiveUserCount.
+  - **Low Cardinality**: 1,000 users (High cache hit rate in CPU, small Redis footprint).
+  - **High Cardinality**: 1,000,000 users (Forces Redis to handle a massive keyspace, testing memory limits and lookup latency).
+
+**3. Clock Skew & Out-of-Order Simulation**
+In real-world distributed systems, "Transaction Time" is rarely perfect.
+- **Latency Jitter**: Introduce a random delay before the producer sends the message to Redpanda.
+- **Clock Skew**: Allow one container instance to have a "system clock" that is 5 seconds ahead of the others.
+- **Thesis Impact**: This allows you to test how your Go Analysis Engine handles "Late Arriving Data." Does your sliding window logic break if a transaction from 10:00:05 arrives after a transaction from 10:00:08?
+
+**4. Traceability (Correlation IDs)**
+To accurately measure End-to-End Latency (from simulator to flagged alert), your simulator must provide a way to "follow" a transaction through the pipeline.
+- **Feature**: Generate a CorrelationID or TraceID for every transaction.
+- **Implementation**: Include this ID in the Protobuf message. When the Analysis Engine flags it, it should include the same ID in the flagged-fraud topic.
+- **Bonus**: If you want to be very advanced, use OpenTelemetry to trace the message from the Go Producer → Redpanda → Go Consumer.
+
+**5. Dynamic Configuration (Hot Reloading)**
+Since you are running this in a container, restarting a container to change the load level is slow and "pollutes" your Prometheus graphs with gaps.
+- **Feature**: Use a simple HTTP Control Plane or a File Watcher (via the viper Go library).
+- **Use Case**: While the test is running, you can "turn a knob" to instantly jump from 1,000 TPS to 10,000 TPS to observe how the Consumer Lag spikes in real-time on your Grafana dashboard.
+
+**6. Advanced Prometheus Metrics**
+Beyond just "Transactions Sent," your simulator should help you debug its own performance:
+- **Producer Latency:** How long does the franz-go client take to get an ACK from Redpanda?
+- **Batch Size Distribution:** Are you sending 1 message at a time, or is the client batching 100?
+- **Error Rates:** Count of "Failed to Publish" events (e.g., if Redpanda is overwhelmed).
+
+
+**Summary of Feature Additions**
+|Feature|Thesis Value|Complexity|
+|---|---|---|
+|Named Attack Scenarios|Proves detection accuracy|Medium|
+|Cardinality Control|Tests Redis limits (Research Q #3)|Low|
+|Clock Skew/Jitter|Tests system robustness & data integrity|High|
+|Correlation IDs|Essential for p99 end-to-end latency measurement|Low|
+|Hot Reloading|Allows for "Stress Test" demos during your defense|Medium|
